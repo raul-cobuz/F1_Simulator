@@ -116,13 +116,17 @@ std::vector<std::unique_ptr<SceneAsset>> sceneAssets;
 SceneAsset* carBody = nullptr;
 std::array<SceneAsset*, 4> carWheels{};
 std::vector<Aabb> colliders;
-std::vector<float> segmentLengths;
+std::vector<glm::vec3> splinePoints;
+std::vector<glm::vec3> splineTangents;
+std::vector<float> splineArc;
 float lapLength = 0.0f;
 
 struct CarState {
     glm::mat4 pose{1.0f};
     float distance = 0.0f;
     float wheelSpin = 0.0f;
+    float steerAngle = 0.0f;
+    float roll = 0.0f;
     float scale = 1.0f;
     bool moving = true;
 } car;
@@ -387,46 +391,118 @@ void loadSceneCoords() {
     }
 }
 
+glm::vec3 catmullRom(const glm::vec3& p0, const glm::vec3& p1, const glm::vec3& p2, const glm::vec3& p3, float t) {
+    float t2 = t * t;
+    float t3 = t2 * t;
+    return 0.5f * ((2.0f * p1) + (-p0 + p2) * t
+                 + (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2
+                 + (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
+}
+
+glm::vec3 catmullRomTangent(const glm::vec3& p0, const glm::vec3& p1, const glm::vec3& p2, const glm::vec3& p3, float t) {
+    float t2 = t * t;
+    return 0.5f * ((-p0 + p2)
+                 + 2.0f * (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t
+                 + 3.0f * (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t2);
+}
+
 void buildPath() {
-    if (coords.waypoints.size() < 2) return;
-    for (size_t i = 0; i < coords.waypoints.size(); ++i) {
-        glm::vec3 delta = coords.waypoints[(i + 1) % coords.waypoints.size()] - coords.waypoints[i];
-        float length = glm::length(delta);
-        segmentLengths.push_back(length);
-        lapLength += length;
+    splinePoints.clear();
+    splineTangents.clear();
+    splineArc.clear();
+    lapLength = 0.0f;
+
+    size_t count = coords.waypoints.size();
+    if (count < 2) return;
+
+    const int samplesPerSegment = 24;
+    for (size_t i = 0; i < count; ++i) {
+        glm::vec3 p0 = coords.waypoints[(i + count - 1) % count];
+        glm::vec3 p1 = coords.waypoints[i];
+        glm::vec3 p2 = coords.waypoints[(i + 1) % count];
+        glm::vec3 p3 = coords.waypoints[(i + 2) % count];
+
+        for (int step = 0; step < samplesPerSegment; ++step) {
+            float t = (float)step / samplesPerSegment;
+            splinePoints.push_back(catmullRom(p0, p1, p2, p3, t));
+            splineTangents.push_back(glm::normalize(catmullRomTangent(p0, p1, p2, p3, t)));
+        }
     }
+
+    splineArc.push_back(0.0f);
+    for (size_t i = 1; i <= splinePoints.size(); ++i) {
+        glm::vec3 delta = splinePoints[i % splinePoints.size()] - splinePoints[i - 1];
+        splineArc.push_back(splineArc.back() + glm::length(delta));
+    }
+    lapLength = splineArc.back();
+}
+
+glm::vec3 samplePath(float distance, glm::vec3& tangent) {
+    float d = std::fmod(distance, lapLength);
+    if (d < 0.0f) d += lapLength;
+
+    auto it = std::upper_bound(splineArc.begin(), splineArc.end(), d);
+    size_t index = (size_t)std::max<long>(1, it - splineArc.begin()) - 1;
+    index = std::min(index, splinePoints.size() - 1);
+
+    float span = splineArc[index + 1] - splineArc[index];
+    float t = span > 0.0f ? (d - splineArc[index]) / span : 0.0f;
+
+    glm::vec3 a = splinePoints[index];
+    glm::vec3 b = splinePoints[(index + 1) % splinePoints.size()];
+    tangent = glm::normalize(glm::mix(splineTangents[index], splineTangents[(index + 1) % splinePoints.size()], t));
+    return glm::mix(a, b, t);
+}
+
+float wrapAngle(float angle) {
+    while (angle > 3.14159265f) angle -= 2.0f * 3.14159265f;
+    while (angle < -3.14159265f) angle += 2.0f * 3.14159265f;
+    return angle;
 }
 
 void updateCar(float dt) {
-    if (coords.waypoints.size() < 2) return;
+    if (splinePoints.size() < 2) return;
 
+    float travelled = 0.0f;
     if (car.moving) {
-        car.distance = std::fmod(car.distance + CAR_SPEED * dt, lapLength);
-        car.wheelSpin = std::fmod(car.wheelSpin - CAR_SPEED * dt / WHEEL_RADIUS, 2.0f * 3.14159265f);
+        travelled = CAR_SPEED * dt;
+        car.distance = std::fmod(car.distance + travelled, lapLength);
+        car.wheelSpin = std::fmod(car.wheelSpin - travelled / WHEEL_RADIUS, 2.0f * 3.14159265f);
     }
 
-    float travelled = car.distance;
-    size_t segment = 0;
-    while (segment < segmentLengths.size() && travelled > segmentLengths[segment]) {
-        travelled -= segmentLengths[segment];
-        ++segment;
-    }
-    if (segment >= segmentLengths.size()) segment = 0;
-
-    glm::vec3 start = coords.waypoints[segment];
-    glm::vec3 end = coords.waypoints[(segment + 1) % coords.waypoints.size()];
-    glm::vec3 forward = glm::normalize(end - start);
-    glm::vec3 position = start + (end - start) * (segmentLengths[segment] > 0.0f ? travelled / segmentLengths[segment] : 0.0f);
+    glm::vec3 tangent;
+    glm::vec3 position = samplePath(car.distance, tangent);
+    glm::vec3 forward = glm::normalize(glm::vec3(tangent.x, 0.0f, tangent.z));
     float heading = std::atan2(-forward.z, forward.x);
 
+    const float lookahead = 3.0f * car.scale;
+    glm::vec3 aheadTangent;
+    samplePath(car.distance + lookahead, aheadTangent);
+    glm::vec3 aheadForward = glm::normalize(glm::vec3(aheadTangent.x, 0.0f, aheadTangent.z));
+    float yawDelta = wrapAngle(std::atan2(-aheadForward.z, aheadForward.x) - heading);
+    float curvature = yawDelta / lookahead;
+
+    float wheelbase = std::max(0.1f, std::abs(coords.wheelCenters[0].x - coords.wheelCenters[2].x)) * car.scale;
+    float steerTarget = glm::clamp(std::atan(wheelbase * curvature), -0.45f, 0.45f);
+    float rollTarget = glm::clamp(curvature * CAR_SPEED * CAR_SPEED * 0.00025f, -0.05f, 0.05f);
+
+    float responseDt = car.moving ? dt : 0.0f;
+    car.steerAngle += (steerTarget - car.steerAngle) * (1.0f - std::exp(-10.0f * responseDt));
+    car.roll += (rollTarget - car.roll) * (1.0f - std::exp(-6.0f * responseDt));
+
     car.pose = glm::translate(glm::mat4(1.0f), position)
-             * glm::rotate(glm::mat4(1.0f), heading, glm::vec3(0.0f, 1.0f, 0.0f));
+             * glm::rotate(glm::mat4(1.0f), heading, glm::vec3(0.0f, 1.0f, 0.0f))
+             * glm::rotate(glm::mat4(1.0f), car.roll, glm::vec3(1.0f, 0.0f, 0.0f));
     glm::mat4 carScale = glm::scale(glm::mat4(1.0f), glm::vec3(car.scale));
     carBody->transform = car.pose * carScale;
 
     for (int i = 0; i < 4; ++i) {
+        glm::mat4 steer = i < 2
+            ? glm::rotate(glm::mat4(1.0f), car.steerAngle, glm::vec3(0.0f, 1.0f, 0.0f))
+            : glm::mat4(1.0f);
         carWheels[i]->transform = car.pose * carScale
             * glm::translate(glm::mat4(1.0f), coords.wheelCenters[i])
+            * steer
             * glm::rotate(glm::mat4(1.0f), car.wheelSpin, coords.wheelAxle);
     }
 }
