@@ -157,6 +157,11 @@ SceneCoords coords;
 std::vector<std::unique_ptr<SceneAsset>> sceneAssets;
 std::unique_ptr<SceneAsset> carBody;
 std::array<std::unique_ptr<SceneAsset>, 4> carWheels;
+std::unique_ptr<SceneAsset> crowdAsset;
+std::unique_ptr<SceneAsset> billboardsAsset;
+std::unique_ptr<SceneAsset> treesAsset;
+std::unique_ptr<SceneAsset> containersAsset;
+std::unique_ptr<SceneAsset> towerAsset;
 std::array<CarState, CAR_COUNT> cars;
 int focusedCar = 0;
 bool carsMoving = true;
@@ -456,7 +461,7 @@ void loadSceneCoords() {
         }
     }
 
-    const char* colliderNames[2] = {"pit_building", "grandstand"};
+    const char* colliderNames[7] = {"pit_building", "grandstand", "crowd", "billboards", "trees", "containers", "tower"};
     for (const char* name : colliderNames) {
         size_t colliderBegin = text.find("\"" + std::string(name) + "\"");
         if (colliderBegin == std::string::npos) continue;
@@ -791,6 +796,11 @@ void initModels() {
     addAsset("grandstand");
     addAsset("start_bridge");
     addAsset("light_poles");
+    crowdAsset = loadModel("crowd");
+    billboardsAsset = loadModel("billboards");
+    treesAsset = loadModel("trees");
+    containersAsset = loadModel("containers");
+    towerAsset = loadModel("tower");
 
     carBody = loadModel("car_body");
     const char* wheelNames[4] = {"wheel_fl", "wheel_fr", "wheel_rl", "wheel_rr"};
@@ -1233,6 +1243,11 @@ void renderShadowPass() {
     for (const auto& asset : sceneAssets) {
         drawDepth(asset->model, asset->transform);
     }
+    if (billboardsAsset) drawDepth(billboardsAsset->model, billboardsAsset->transform);
+    if (treesAsset) drawDepth(treesAsset->model, treesAsset->transform);
+    if (containersAsset) drawDepth(containersAsset->model, containersAsset->transform);
+    if (towerAsset) drawDepth(towerAsset->model, towerAsset->transform);
+    if (crowdAsset) drawDepth(crowdAsset->model, crowdAsset->transform);
     for (const CarState& state : cars) {
         drawDepth(carBody->model, state.bodyTransform);
         for (int i = 0; i < 4; ++i) {
@@ -1291,6 +1306,21 @@ void renderScene(float dt) {
     for (const auto& asset : sceneAssets) {
         drawLit(asset->model, asset->transform, glm::vec3(1.0f), 0.0f);
     }
+    if (billboardsAsset) drawLit(billboardsAsset->model, billboardsAsset->transform, glm::vec3(1.0f), 0.0f);
+    if (treesAsset) drawLit(treesAsset->model, treesAsset->transform, glm::vec3(1.0f), 0.0f);
+    if (containersAsset) drawLit(containersAsset->model, containersAsset->transform, glm::vec3(1.0f), 0.0f);
+    if (towerAsset) drawLit(towerAsset->model, towerAsset->transform, glm::vec3(1.0f), 0.0f);
+
+    // Animated crowd: subtle vertical oscillation + slight rotation (applause/enthusiasm)
+    if (crowdAsset) {
+        float t = (float)glfwGetTime();
+        float sway = 0.015f * sinf(t * 2.3f) + 0.008f * sinf(t * 3.7f);
+        float twist = 0.003f * sinf(t * 1.9f) + 0.002f * cosf(t * 2.8f);
+        glm::mat4 crowdTransform = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, sway, 0.0f))
+                                 * glm::rotate(glm::mat4(1.0f), twist, glm::vec3(0.0f, 1.0f, 0.0f));
+        drawLit(crowdAsset->model, crowdTransform, glm::vec3(1.0f), 0.0f);
+    }
+
     for (const CarState& state : cars) {
         drawLit(carBody->model, state.bodyTransform, state.accentColor, state.accentMix);
         for (int i = 0; i < 4; ++i) {
