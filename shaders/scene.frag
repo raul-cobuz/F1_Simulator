@@ -25,6 +25,8 @@ uniform float spotOuterCos;
 
 uniform sampler2D diffuseTexture;
 uniform sampler2D specularTexture;
+uniform vec3 accentColor;
+uniform float accentMix;
 uniform sampler2D shadowMap;
 uniform bool flatShading;
 
@@ -72,6 +74,8 @@ void main() {
     }
 
     vec3 albedo = texture(diffuseTexture, fTexCoords).rgb;
+    float luma = dot(albedo, vec3(0.299, 0.587, 0.114));
+    albedo = mix(albedo, accentColor * (0.35 + 0.65 * luma), accentMix);
     vec3 specMask = texture(specularTexture, fTexCoords).rgb;
     vec3 color = ambientColor * albedo;
 

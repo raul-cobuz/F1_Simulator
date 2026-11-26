@@ -37,6 +37,12 @@ const int RAIN_COUNT = 2000;
 const float CAR_SPEED = 26.0f;
 const float WHEEL_RADIUS = 0.36f;
 const float CAMERA_RADIUS = 0.6f;
+const float CAR_COLLISION_RADIUS = 1.1f;
+const float DRIVE_MAX_SPEED = 55.0f;
+const float DRIVE_REVERSE_SPEED = 8.0f;
+const float DRIVE_ACCEL = 14.0f;
+const float DRIVE_BRAKE = 26.0f;
+const float DRIVE_DRAG = 4.0f;
 
 const glm::vec3 SCENE_MIN(-230.0f, 0.0f, -150.0f);
 const glm::vec3 SCENE_MAX(240.0f, 120.0f, 90.0f);
@@ -89,6 +95,8 @@ GLint projectionLoc;
 GLint normalMatrixLoc;
 GLint viewPosLoc;
 GLint flatShadingLoc;
+GLint accentColorLoc;
+GLint accentMixLoc;
 GLint ambientColorLoc;
 GLint dirLightDirectionLoc;
 GLint dirLightColorLoc;
@@ -111,25 +119,52 @@ GLint skyboxProjectionLoc;
 GLint skyboxViewLoc;
 GLint skyboxSamplerLoc;
 
+const int CAR_COUNT = 4;
+
+struct CarState {
+    glm::mat4 pose{1.0f};
+    glm::mat4 bodyTransform{1.0f};
+    std::array<glm::mat4, 4> wheelTransforms{};
+    glm::vec3 accentColor{1.0f};
+    float accentMix = 0.0f;
+    float laneOffset = 0.0f;
+    float speed = CAR_SPEED;
+    float cruiseSpeed = CAR_SPEED;
+    float distance = 0.0f;
+    float yaw = 0.0f;
+    float wheelSpin = 0.0f;
+    float steerAngle = 0.0f;
+    float roll = 0.0f;
+    float scale = 1.0f;
+    bool manual = false;
+};
+
+struct CarSetup {
+    float speed;
+    float laneOffset;
+    float gridOffset;
+    glm::vec3 accentColor;
+};
+
+const std::array<CarSetup, CAR_COUNT> CAR_SETUPS{{
+    {26.0f, -1.4f,   0.0f, {1.0f, 1.0f, 1.0f}},
+    {25.4f,  1.4f, -14.0f, {0.15f, 0.45f, 1.0f}},
+    {26.7f, -3.8f, -28.0f, {1.0f, 0.8f, 0.2f}},
+    {26.3f,  3.8f, -42.0f, {0.2f, 0.9f, 0.45f}}
+}};
+
 SceneCoords coords;
 std::vector<std::unique_ptr<SceneAsset>> sceneAssets;
-SceneAsset* carBody = nullptr;
-std::array<SceneAsset*, 4> carWheels{};
+std::unique_ptr<SceneAsset> carBody;
+std::array<std::unique_ptr<SceneAsset>, 4> carWheels;
+std::array<CarState, CAR_COUNT> cars;
+int focusedCar = 0;
+bool carsMoving = true;
 std::vector<Aabb> colliders;
 std::vector<glm::vec3> splinePoints;
 std::vector<glm::vec3> splineTangents;
 std::vector<float> splineArc;
 float lapLength = 0.0f;
-
-struct CarState {
-    glm::mat4 pose{1.0f};
-    float distance = 0.0f;
-    float wheelSpin = 0.0f;
-    float steerAngle = 0.0f;
-    float roll = 0.0f;
-    float scale = 1.0f;
-    bool moving = true;
-} car;
 
 const glm::vec3 moonDirection = glm::normalize(glm::vec3(0.25f, -0.9f, 0.2f));
 const glm::vec3 moonColor(0.55f, 0.62f, 0.85f);
@@ -162,11 +197,20 @@ double lastMouseY = 0.0;
 double ignoreMouseUntil = 0.0;
 bool cursorDisabled = true;
 bool cameraTour = false;
+bool chaseCamera = false;
+bool driveMode = false;
+glm::vec3 chasePosition(0.0f);
+glm::vec3 chaseTarget(0.0f);
 float tourTime = 0.0f;
 bool floodlightsEnabled = true;
 bool spotlightsEnabled = true;
 bool flatShading = false;
 GLenum polygonMode = GL_FILL;
+
+void enterDriveMode();
+void exitDriveMode();
+void resetFocusedCar();
+void snapChaseCamera();
 
 GLenum glCheckError_(const char *file, int line)
 {
@@ -248,12 +292,51 @@ void keyboardCallback(GLFWwindow* window, int key, int scancode, int action, int
             ignoreMouseUntil = glfwGetTime() + 0.25;
             break;
         case GLFW_KEY_SPACE:
-            car.moving = !car.moving;
-            std::cout << "Car: " << (car.moving ? "moving" : "paused") << std::endl;
+            carsMoving = !carsMoving;
+            std::cout << "Cars: " << (carsMoving ? "moving" : "paused") << std::endl;
+            break;
+        case GLFW_KEY_C:
+            if (driveMode) {
+                exitDriveMode();
+                std::cout << "Drive mode: off" << std::endl;
+            } else {
+                enterDriveMode();
+                std::cout << "Drive mode: on (car " << focusedCar + 1 << ")" << std::endl;
+            }
+            break;
+        case GLFW_KEY_V:
+            if (driveMode) {
+                exitDriveMode();
+                std::cout << "Chase camera: off | Drive mode: off" << std::endl;
+            } else {
+                chaseCamera = !chaseCamera;
+                if (chaseCamera) {
+                    cameraTour = false;
+                    snapChaseCamera();
+                }
+                std::cout << "Chase camera: " << (chaseCamera ? "on" : "off") << std::endl;
+            }
+            break;
+        case GLFW_KEY_B:
+            if (driveMode) {
+                std::cout << "Exit drive mode to switch car" << std::endl;
+            } else {
+                focusedCar = (focusedCar + 1) % CAR_COUNT;
+                if (chaseCamera) snapChaseCamera();
+                std::cout << "Spotlight car: " << focusedCar + 1 << "/" << CAR_COUNT << std::endl;
+            }
+            break;
+        case GLFW_KEY_R:
+            resetFocusedCar();
+            std::cout << "Car reset" << std::endl;
             break;
         case GLFW_KEY_P:
             cameraTour = !cameraTour;
             tourTime = 0.0f;
+            if (cameraTour) {
+                chaseCamera = false;
+                if (driveMode) exitDriveMode();
+            }
             std::cout << "Camera tour: " << (cameraTour ? "on" : "off") << std::endl;
             break;
         case GLFW_KEY_1:
@@ -282,12 +365,12 @@ void keyboardCallback(GLFWwindow* window, int key, int scancode, int action, int
             std::cout << "Car spotlight: " << (spotlightsEnabled ? "on" : "off") << std::endl;
             break;
         case GLFW_KEY_Z:
-            car.scale = std::max(0.5f, car.scale - 0.1f);
-            std::cout << "Car scale: " << car.scale << std::endl;
+            cars[focusedCar].scale = std::max(0.5f, cars[focusedCar].scale - 0.1f);
+            std::cout << "Car scale: " << cars[focusedCar].scale << std::endl;
             break;
         case GLFW_KEY_X:
-            car.scale = std::min(2.0f, car.scale + 0.1f);
-            std::cout << "Car scale: " << car.scale << std::endl;
+            cars[focusedCar].scale = std::min(2.0f, cars[focusedCar].scale + 0.1f);
+            std::cout << "Car scale: " << cars[focusedCar].scale << std::endl;
             break;
         case GLFW_KEY_F:
             fogEnabled = !fogEnabled;
@@ -460,68 +543,245 @@ float wrapAngle(float angle) {
     return angle;
 }
 
-void updateCar(float dt) {
-    if (splinePoints.size() < 2) return;
-
-    float travelled = 0.0f;
-    if (car.moving) {
-        travelled = CAR_SPEED * dt;
-        car.distance = std::fmod(car.distance + travelled, lapLength);
-        car.wheelSpin = std::fmod(car.wheelSpin - travelled / WHEEL_RADIUS, 2.0f * 3.14159265f);
-    }
-
+glm::vec3 lanePoint(float distance, float laneOffset) {
     glm::vec3 tangent;
-    glm::vec3 position = samplePath(car.distance, tangent);
-    glm::vec3 forward = glm::normalize(glm::vec3(tangent.x, 0.0f, tangent.z));
-    float heading = std::atan2(-forward.z, forward.x);
+    glm::vec3 position = samplePath(distance, tangent);
+    float yaw = std::atan2(-tangent.z, tangent.x);
+    return position + glm::vec3(std::sin(yaw), 0.0f, std::cos(yaw)) * laneOffset;
+}
 
-    const float lookahead = 3.0f * car.scale;
-    glm::vec3 aheadTangent;
-    samplePath(car.distance + lookahead, aheadTangent);
-    glm::vec3 aheadForward = glm::normalize(glm::vec3(aheadTangent.x, 0.0f, aheadTangent.z));
-    float yawDelta = wrapAngle(std::atan2(-aheadForward.z, aheadForward.x) - heading);
-    float curvature = yawDelta / lookahead;
+glm::vec3 laneForward(float distance, float laneOffset) {
+    glm::vec3 a = lanePoint(distance - 0.5f, laneOffset);
+    glm::vec3 b = lanePoint(distance + 0.5f, laneOffset);
+    return glm::normalize(glm::vec3(b.x - a.x, 0.0f, b.z - a.z));
+}
 
-    float wheelbase = std::max(0.1f, std::abs(coords.wheelCenters[0].x - coords.wheelCenters[2].x)) * car.scale;
-    float steerTarget = glm::clamp(std::atan(wheelbase * curvature), -0.45f, 0.45f);
-    float rollTarget = glm::clamp(curvature * CAR_SPEED * CAR_SPEED * 0.00025f, -0.05f, 0.05f);
-
-    float responseDt = car.moving ? dt : 0.0f;
-    car.steerAngle += (steerTarget - car.steerAngle) * (1.0f - std::exp(-10.0f * responseDt));
-    car.roll += (rollTarget - car.roll) * (1.0f - std::exp(-6.0f * responseDt));
-
-    car.pose = glm::translate(glm::mat4(1.0f), position)
-             * glm::rotate(glm::mat4(1.0f), heading, glm::vec3(0.0f, 1.0f, 0.0f))
-             * glm::rotate(glm::mat4(1.0f), car.roll, glm::vec3(1.0f, 0.0f, 0.0f));
-    glm::mat4 carScale = glm::scale(glm::mat4(1.0f), glm::vec3(car.scale));
-    carBody->transform = car.pose * carScale;
+void updateCarTransforms(CarState& state) {
+    glm::mat4 carScale = glm::scale(glm::mat4(1.0f), glm::vec3(state.scale));
+    state.bodyTransform = state.pose * carScale;
 
     for (int i = 0; i < 4; ++i) {
         glm::mat4 steer = i < 2
-            ? glm::rotate(glm::mat4(1.0f), car.steerAngle, glm::vec3(0.0f, 1.0f, 0.0f))
+            ? glm::rotate(glm::mat4(1.0f), state.steerAngle, glm::vec3(0.0f, 1.0f, 0.0f))
             : glm::mat4(1.0f);
-        carWheels[i]->transform = car.pose * carScale
+        state.wheelTransforms[i] = state.pose * carScale
             * glm::translate(glm::mat4(1.0f), coords.wheelCenters[i])
             * steer
-            * glm::rotate(glm::mat4(1.0f), car.wheelSpin, coords.wheelAxle);
+            * glm::rotate(glm::mat4(1.0f), state.wheelSpin, coords.wheelAxle);
     }
 }
 
-void addAsset(const std::string& name, glm::mat4 transform = glm::mat4(1.0f)) {
+void updateCars(float dt) {
+    if (splinePoints.size() < 2) return;
+
+    float wheelbase = std::max(0.1f, std::abs(coords.wheelCenters[0].x - coords.wheelCenters[2].x));
+
+    for (CarState& state : cars) {
+        if (state.manual) continue;
+
+        if (carsMoving) {
+            float travelled = state.speed * dt;
+            state.distance = std::fmod(state.distance + travelled, lapLength);
+            state.wheelSpin = std::fmod(state.wheelSpin - travelled / WHEEL_RADIUS, 2.0f * 3.14159265f);
+        }
+
+        glm::vec3 position = lanePoint(state.distance, state.laneOffset);
+        glm::vec3 forward = laneForward(state.distance, state.laneOffset);
+        float heading = std::atan2(-forward.z, forward.x);
+
+        const float lookahead = 3.0f * state.scale;
+        glm::vec3 aheadForward = laneForward(state.distance + lookahead, state.laneOffset);
+        float yawDelta = wrapAngle(std::atan2(-aheadForward.z, aheadForward.x) - heading);
+        float curvature = yawDelta / lookahead;
+
+        float steerTarget = glm::clamp(std::atan(wheelbase * state.scale * curvature), -0.45f, 0.45f);
+        float rollTarget = glm::clamp(curvature * state.speed * state.speed * 0.00025f, -0.05f, 0.05f);
+
+        float responseDt = carsMoving ? dt : 0.0f;
+        state.steerAngle += (steerTarget - state.steerAngle) * (1.0f - std::exp(-10.0f * responseDt));
+        state.roll += (rollTarget - state.roll) * (1.0f - std::exp(-6.0f * responseDt));
+
+        state.pose = glm::translate(glm::mat4(1.0f), position)
+                   * glm::rotate(glm::mat4(1.0f), heading, glm::vec3(0.0f, 1.0f, 0.0f))
+                   * glm::rotate(glm::mat4(1.0f), state.roll, glm::vec3(1.0f, 0.0f, 0.0f));
+        updateCarTransforms(state);
+    }
+}
+
+float nearestSplineDistance(const glm::vec3& position) {
+    float bestDistance = 0.0f;
+    float bestSquared = std::numeric_limits<float>::max();
+    for (size_t i = 0; i < splinePoints.size(); ++i) {
+        float dx = splinePoints[i].x - position.x;
+        float dz = splinePoints[i].z - position.z;
+        float squared = dx * dx + dz * dz;
+        if (squared < bestSquared) {
+            bestSquared = squared;
+            bestDistance = splineArc[i];
+        }
+    }
+    return bestDistance;
+}
+
+bool pointBlocked(const glm::vec3& position, float radius) {
+    if (position.x < SCENE_MIN.x + radius || position.x > SCENE_MAX.x - radius ||
+        position.z < SCENE_MIN.z + radius || position.z > SCENE_MAX.z - radius) {
+        return true;
+    }
+
+    for (const Aabb& box : colliders) {
+        if (position.x > box.min.x - radius && position.x < box.max.x + radius &&
+            position.z > box.min.z - radius && position.z < box.max.z + radius) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool carBlocked(const glm::vec3& position, const CarState* self) {
+    glm::vec3 forward(1.0f, 0.0f, 0.0f);
+    if (self) forward = glm::vec3(std::cos(self->yaw), 0.0f, -std::sin(self->yaw));
+
+    for (float offset : {-1.3f, 0.0f, 1.3f}) {
+        if (pointBlocked(position + forward * offset, CAR_COLLISION_RADIUS)) {
+            return true;
+        }
+    }
+
+    if (self) {
+        glm::vec3 right(std::sin(self->yaw), 0.0f, std::cos(self->yaw));
+        for (const CarState& other : cars) {
+            if (&other == self) continue;
+            glm::vec3 delta = glm::vec3(other.pose[3]) - position;
+            if (std::abs(glm::dot(delta, forward)) < 4.2f && std::abs(glm::dot(delta, right)) < 1.5f) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void updateManualCar(CarState& state, float dt) {
+    if (!carsMoving) return;
+
+    float throttle = (pressedKeys[GLFW_KEY_W] ? 1.0f : 0.0f) - (pressedKeys[GLFW_KEY_S] ? 1.0f : 0.0f);
+    float steerInput = (pressedKeys[GLFW_KEY_A] ? 1.0f : 0.0f) - (pressedKeys[GLFW_KEY_D] ? 1.0f : 0.0f);
+
+    if (throttle > 0.0f) {
+        state.speed += DRIVE_ACCEL * dt;
+    } else if (throttle < 0.0f) {
+        state.speed -= DRIVE_BRAKE * dt;
+    } else {
+        float drag = DRIVE_DRAG * dt;
+        state.speed = std::abs(state.speed) <= drag ? 0.0f : state.speed - std::copysign(drag, state.speed);
+    }
+    state.speed = std::clamp(state.speed, -DRIVE_REVERSE_SPEED, DRIVE_MAX_SPEED);
+
+    float maxSteer = 0.5f / (1.0f + 0.05f * std::abs(state.speed));
+    state.steerAngle += (steerInput * maxSteer - state.steerAngle) * (1.0f - std::exp(-8.0f * dt));
+
+    float wheelbase = std::max(0.1f, std::abs(coords.wheelCenters[0].x - coords.wheelCenters[2].x));
+    float yawRate = state.speed / wheelbase * std::tan(state.steerAngle);
+    state.yaw += yawRate * dt;
+
+    float rollTarget = glm::clamp(yawRate * state.speed * 0.0006f, -0.05f, 0.05f);
+    state.roll += (rollTarget - state.roll) * (1.0f - std::exp(-6.0f * dt));
+
+    glm::vec3 forward(std::cos(state.yaw), 0.0f, -std::sin(state.yaw));
+    glm::vec3 position(state.pose[3]);
+    glm::vec3 target = position + forward * (state.speed * dt);
+
+    if (carBlocked(target, &state)) {
+        glm::vec3 slideX(target.x, position.y, position.z);
+        glm::vec3 slideZ(position.x, position.y, target.z);
+        if (!carBlocked(slideX, &state)) {
+            target = slideX;
+        } else if (!carBlocked(slideZ, &state)) {
+            target = slideZ;
+        } else {
+            target = position;
+            state.speed = 0.0f;
+        }
+    }
+
+    float travelled = glm::dot(target - position, forward);
+    state.wheelSpin = std::fmod(state.wheelSpin - travelled / WHEEL_RADIUS, 2.0f * 3.14159265f);
+
+    state.pose = glm::translate(glm::mat4(1.0f), target)
+               * glm::rotate(glm::mat4(1.0f), state.yaw, glm::vec3(0.0f, 1.0f, 0.0f))
+               * glm::rotate(glm::mat4(1.0f), state.roll, glm::vec3(1.0f, 0.0f, 0.0f));
+    updateCarTransforms(state);
+}
+
+void enterDriveMode() {
+    driveMode = true;
+    chaseCamera = true;
+    cameraTour = false;
+
+    CarState& state = cars[focusedCar];
+    state.manual = true;
+    state.speed = state.cruiseSpeed;
+    state.yaw = std::atan2(-state.pose[0][2], state.pose[0][0]);
+    state.steerAngle = 0.0f;
+    state.roll = 0.0f;
+    snapChaseCamera();
+}
+
+void exitDriveMode() {
+    CarState& state = cars[focusedCar];
+    state.manual = false;
+    state.speed = state.cruiseSpeed;
+    state.distance = nearestSplineDistance(state.pose[3]);
+    state.steerAngle = 0.0f;
+    state.roll = 0.0f;
+    driveMode = false;
+    chaseCamera = false;
+}
+
+void resetFocusedCar() {
+    CarState& state = cars[focusedCar];
+    float distance = nearestSplineDistance(state.pose[3]);
+    float lane = state.manual ? 0.0f : state.laneOffset;
+
+    glm::vec3 position = lanePoint(distance, lane);
+    glm::vec3 forward = laneForward(distance, lane);
+    state.distance = distance;
+    state.yaw = std::atan2(-forward.z, forward.x);
+    state.speed = state.manual ? 0.0f : state.cruiseSpeed;
+    state.steerAngle = 0.0f;
+    state.roll = 0.0f;
+    state.pose = glm::translate(glm::mat4(1.0f), position)
+               * glm::rotate(glm::mat4(1.0f), state.yaw, glm::vec3(0.0f, 1.0f, 0.0f));
+    updateCarTransforms(state);
+    if (chaseCamera) snapChaseCamera();
+}
+
+std::unique_ptr<SceneAsset> loadModel(const std::string& name) {
     auto asset = std::make_unique<SceneAsset>();
     asset->name = name;
-    asset->transform = transform;
     asset->model.LoadModel("models/f1_circuit/" + name + ".obj");
-    sceneAssets.push_back(std::move(asset));
+    return asset;
+}
+
+void addAsset(const std::string& name) {
+    sceneAssets.push_back(loadModel(name));
+}
+
+void initCars() {
+    for (int i = 0; i < CAR_COUNT; ++i) {
+        CarState& state = cars[i];
+        state.speed = CAR_SETUPS[i].speed;
+        state.cruiseSpeed = CAR_SETUPS[i].speed;
+        state.laneOffset = CAR_SETUPS[i].laneOffset;
+        state.distance = CAR_SETUPS[i].gridOffset;
+        state.accentColor = CAR_SETUPS[i].accentColor;
+        state.accentMix = i == 0 ? 0.0f : 0.65f;
+    }
 }
 
 void initModels() {
     loadSceneCoords();
     buildPath();
-
-    float carYaw = std::atan2(-coords.carForward.z, coords.carForward.x);
-    glm::mat4 carTransform = glm::translate(glm::mat4(1.0f), coords.carStart)
-                           * glm::rotate(glm::mat4(1.0f), carYaw, glm::vec3(0.0f, 1.0f, 0.0f));
 
     addAsset("ground");
     addAsset("track");
@@ -531,21 +791,15 @@ void initModels() {
     addAsset("grandstand");
     addAsset("start_bridge");
     addAsset("light_poles");
-    addAsset("car_body", carTransform);
 
+    carBody = loadModel("car_body");
     const char* wheelNames[4] = {"wheel_fl", "wheel_fr", "wheel_rl", "wheel_rr"};
     for (int i = 0; i < 4; ++i) {
-        addAsset(wheelNames[i], carTransform * glm::translate(glm::mat4(1.0f), coords.wheelCenters[i]));
+        carWheels[i] = loadModel(wheelNames[i]);
     }
 
-    for (const auto& asset : sceneAssets) {
-        if (asset->name == "car_body") carBody = asset.get();
-        for (int i = 0; i < 4; ++i) {
-            if (asset->name == wheelNames[i]) carWheels[i] = asset.get();
-        }
-    }
-
-    updateCar(0.0f);
+    initCars();
+    updateCars(0.0f);
 }
 
 void initShadowResources() {
@@ -822,6 +1076,8 @@ void initUniforms() {
     normalMatrixLoc = glGetUniformLocation(program, "normalMatrix");
     viewPosLoc = glGetUniformLocation(program, "viewPos");
     flatShadingLoc = glGetUniformLocation(program, "flatShading");
+    accentColorLoc = glGetUniformLocation(program, "accentColor");
+    accentMixLoc = glGetUniformLocation(program, "accentMix");
     ambientColorLoc = glGetUniformLocation(program, "ambientColor");
     dirLightDirectionLoc = glGetUniformLocation(program, "dirLightDirection");
     dirLightColorLoc = glGetUniformLocation(program, "dirLightColor");
@@ -880,6 +1136,8 @@ void moveCameraStep(gps::MOVE_DIRECTION direction, float distance) {
 }
 
 void processMovement(float dt) {
+    if (driveMode) return;
+
     float speed = cameraSpeed * dt;
     if (pressedKeys[GLFW_KEY_LEFT_SHIFT] || pressedKeys[GLFW_KEY_RIGHT_SHIFT]) speed *= 3.0f;
 
@@ -892,6 +1150,29 @@ void processMovement(float dt) {
     if (moved && cameraTour) cameraTour = false;
 }
 
+void chaseDesired(const CarState& state, glm::vec3& position, glm::vec3& target) {
+    glm::vec3 forward = glm::normalize(glm::vec3(state.pose[0][0], 0.0f, state.pose[0][2]));
+    glm::vec3 carPosition(state.pose[3]);
+    position = carPosition - forward * (8.0f * state.scale) + glm::vec3(0.0f, 5.5f * state.scale, 0.0f);
+    target = carPosition + forward * (5.0f * state.scale) + glm::vec3(0.0f, 1.0f * state.scale, 0.0f);
+}
+
+void snapChaseCamera() {
+    chaseDesired(cars[focusedCar], chasePosition, chaseTarget);
+}
+
+void updateChaseCamera(float dt) {
+    glm::vec3 position;
+    glm::vec3 target;
+    chaseDesired(cars[focusedCar], position, target);
+
+    float blend = 1.0f - std::exp(-6.0f * dt);
+    chasePosition = glm::mix(chasePosition, position, blend);
+    chaseTarget = glm::mix(chaseTarget, target, blend);
+    chasePosition.y = std::max(chasePosition.y, 1.0f);
+    myCamera.setView(chasePosition, chaseTarget);
+}
+
 void updateCamera(float dt) {
     if (cameraTour) {
         tourTime += dt;
@@ -902,6 +1183,8 @@ void updateCamera(float dt) {
             150.0f + std::sin(tourTime * 0.23f) * 25.0f,
             center.z + std::sin(angle) * 330.0f);
         myCamera.setView(position, center);
+    } else if (chaseCamera) {
+        updateChaseCamera(dt);
     }
 
     view = myCamera.getViewMatrix();
@@ -920,9 +1203,10 @@ void setLightUniforms() {
     glUniform3fv(pointLightPosLoc, MAX_POINT_LIGHTS, glm::value_ptr(pointPositions[0]));
     glUniform3fv(pointLightColorLoc, MAX_POINT_LIGHTS, glm::value_ptr(pointColors[0]));
 
-    glm::vec3 forward = glm::normalize(glm::vec3(car.pose[0][0], 0.0f, car.pose[0][2]));
-    glm::vec3 carPosition(car.pose[3]);
-    glm::vec3 spotPosition = carPosition + forward * (3.2f * car.scale) + glm::vec3(0.0f, 0.8f * car.scale, 0.0f);
+    const CarState& focus = cars[focusedCar];
+    glm::vec3 forward = glm::normalize(glm::vec3(focus.pose[0][0], 0.0f, focus.pose[0][2]));
+    glm::vec3 carPosition(focus.pose[3]);
+    glm::vec3 spotPosition = carPosition + forward * (3.2f * focus.scale) + glm::vec3(0.0f, 0.8f * focus.scale, 0.0f);
     glm::vec3 spotColor = spotlightsEnabled ? glm::vec3(1.9f, 1.7f, 1.4f) : glm::vec3(0.0f);
 
     glUniform3fv(spotLightPosLoc, 1, glm::value_ptr(spotPosition));
@@ -942,9 +1226,18 @@ void renderShadowPass() {
     glEnable(GL_POLYGON_OFFSET_FILL);
     glPolygonOffset(2.0f, 4.0f);
     glCullFace(GL_FRONT);
+    auto drawDepth = [](gps::Model3D& model, const glm::mat4& transform) {
+        glUniformMatrix4fv(depthModelLoc, 1, GL_FALSE, glm::value_ptr(transform));
+        model.Draw(depthShader);
+    };
     for (const auto& asset : sceneAssets) {
-        glUniformMatrix4fv(depthModelLoc, 1, GL_FALSE, glm::value_ptr(asset->transform));
-        asset->model.Draw(depthShader);
+        drawDepth(asset->model, asset->transform);
+    }
+    for (const CarState& state : cars) {
+        drawDepth(carBody->model, state.bodyTransform);
+        for (int i = 0; i < 4; ++i) {
+            drawDepth(carWheels[i]->model, state.wheelTransforms[i]);
+        }
     }
     glDisable(GL_POLYGON_OFFSET_FILL);
     glCullFace(GL_BACK);
@@ -987,11 +1280,22 @@ void renderScene(float dt) {
     glBindTexture(GL_TEXTURE_2D, shadowMap);
     glActiveTexture(GL_TEXTURE0);
 
-    for (const auto& asset : sceneAssets) {
-        glm::mat3 normalMatrix = glm::mat3(glm::transpose(glm::inverse(asset->transform)));
-        glUniformMatrix4fv(modelLoc, 1, GL_FALSE, glm::value_ptr(asset->transform));
+    auto drawLit = [](gps::Model3D& model, const glm::mat4& transform, const glm::vec3& accent, float accentMix) {
+        glm::mat3 normalMatrix = glm::mat3(glm::transpose(glm::inverse(transform)));
+        glUniformMatrix4fv(modelLoc, 1, GL_FALSE, glm::value_ptr(transform));
         glUniformMatrix3fv(normalMatrixLoc, 1, GL_FALSE, glm::value_ptr(normalMatrix));
-        asset->model.Draw(sceneShader);
+        glUniform3fv(accentColorLoc, 1, glm::value_ptr(accent));
+        glUniform1f(accentMixLoc, accentMix);
+        model.Draw(sceneShader);
+    };
+    for (const auto& asset : sceneAssets) {
+        drawLit(asset->model, asset->transform, glm::vec3(1.0f), 0.0f);
+    }
+    for (const CarState& state : cars) {
+        drawLit(carBody->model, state.bodyTransform, state.accentColor, state.accentMix);
+        for (int i = 0; i < 4; ++i) {
+            drawLit(carWheels[i]->model, state.wheelTransforms[i], glm::vec3(1.0f), 0.0f);
+        }
     }
 
     renderSkybox();
@@ -1023,8 +1327,9 @@ int main(int argc, const char * argv[]) {
     glfwSetInputMode(myWindow.getWindow(), GLFW_CURSOR, GLFW_CURSOR_DISABLED);
     ignoreMouseUntil = glfwGetTime() + 0.5;
 
-    std::cout << "WASD: move | mouse: look | Shift: boost | Tab: capture/release mouse | Space: pause car\n"
-              << "P: camera tour | 1/2/3: solid/wire/points | 4: flat/smooth | Z/X: car scale\n"
+    std::cout << "WASD: move | mouse: look | Shift: boost | Tab: capture/release mouse | Space: pause cars\n"
+              << "C: drive mode (WASD drive) | V: chase camera | R: reset car | B: switch car\n"
+              << "P: camera tour | 1/2/3: solid/wire/points | 4: flat/smooth | Z/X: scale car\n"
               << "K: floodlights | L: car spotlight | F: fog | -/=: fog density | Esc: quit" << std::endl;
 
     glCheckError();
@@ -1034,7 +1339,8 @@ int main(int argc, const char * argv[]) {
         deltaTime = std::min(now - lastFrameTime, 0.1f);
         lastFrameTime = now;
 
-        updateCar(deltaTime);
+        if (driveMode) updateManualCar(cars[focusedCar], deltaTime);
+        updateCars(deltaTime);
         processMovement(deltaTime);
         updateCamera(deltaTime);
         renderScene(deltaTime);
